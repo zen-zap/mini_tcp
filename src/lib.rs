@@ -1,11 +1,10 @@
 use std::io::prelude::*;
 use std::io;
-use std::collections::HashMap;
 use std::thread;
 use std::sync::{Arc, Mutex, Condvar}; 
 // NOTE: read about mpsc channels -- multiple producer single consumer
 // NOTE: read about Mutex, Arc, Condvar again
-use std::collections::{VecDeque, hash_map::Entry};
+use std::collections::{VecDeque, hash_map::Entry, HashMap};
 // get a recap about Arc, Mutex, Condvar
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
@@ -74,7 +73,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()>
         // timer has to be triggered
         let mut pfd = [nix::poll::PollFd::new(nic.as_raw_fd(), nix::poll::PollFlags::POLLIN)];
         let n = nix::poll::poll(&mut pfd[..], 1).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        // we just made the TimeOut to be at every millisecon dd-- ofc this can be optimized
+        // we just made the TimeOut to be at every 1 second -- this can be optimized
         assert_ne!(n, -1);
         if n==0
         {
@@ -84,7 +83,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()>
                 connection.on_tick(&mut nic)?;
             }
         }
-        assert_eq!(n, 1);
+        // assert_eq!(n, 1);
         // if we get down here, that means the filedescriptor is ready and we can do something with it
         let nbytes = nic.recv(&mut buf[..]).expect("failed to read from Tun");        
 
@@ -133,7 +132,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()>
                             Entry::Occupied(mut c) =>
                             {
                                 eprintln!("occupied entry found!");
-                                // eprintln!("got packet for known quad: {:#?}", q);
+                                eprintln!("got packet for known quad: {:#?}", q);
                                 // if there is a connection, we're just gonna process the packet
                                 let a = c.get_mut()
                                     .on_packet(&mut nic, iph, tcph, &buf[datai..nbytes])?;
@@ -141,8 +140,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()>
                                 // reading or writing or neither or maybe Both? 
 
                                 eprintln!("Availability: {:?}", a);
-
-                                // TODO: compare before/after -- if it was available for read before this and read after this .. there's no need to notify anyone -- this is more like a performance optimization
+                                
                                 drop(cmg); // we're gonna give up the lock anyways
                                 if a.contains(tcp::Available::READ)
                                 {
@@ -155,12 +153,13 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()>
                                     // TODO: ih.snd_var.notify_all();
                                 }
                             }
+
                             // * the connection for the Quad was vacant .. 
                             Entry::Vacant(e) => 
                             {
                                 eprintln!("vacant entry found!");
-                                // eprintln!("got packet for unknown quad: {:#?}", q);
-                                // ? if it's vacant, the question becomes -- is someone waiting for it?
+                                eprintln!("got packet for unknown quad: {:#?}", q);
+                                // >) if it's vacant, the question becomes -- is someone waiting for it?
                                 // * check if there is a listener waiting on the destination port the given Quad
                                 if let Some(pending) = cm.pending.get_mut(&tcph.destination_port()) 
                                 {
@@ -182,10 +181,10 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()>
                                         // TODO: wake up pending accept 
                                     }
                                 }
-                                // else 
-                                // {
-                                //     eprintln!("No Listener! -- so ignoring...");
-                                // }
+                                else 
+                                {
+                                    eprintln!("No Listener! -- so ignoring...");
+                                }
                             }
                         }
                     }
@@ -213,7 +212,7 @@ impl Interface
     pub fn new() -> io::Result<Self>
     {   
         let nic= tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
-        let ih: InterfaceHandle = Arc::new(Foobar::default());
+        let ih: InterfaceHandle = Arc::default();
 
         // now we're gonna spawn some thread .. that's gonna handle the nic
         let jh = 
@@ -227,7 +226,7 @@ impl Interface
             })
         };
         Ok(Interface { ih: Some(ih), jh: Some(jh) })
-    }
+    }   
     
     pub fn bind(&mut self, port: u16) -> io::Result<TcpListener>
     {
@@ -319,6 +318,7 @@ impl Drop for TcpStream
         // even after we send a FIn , we still gotta wait for them to ACK that FIN .. or else -- we might have to resend the FIN
     }
 }
+
 impl Read for TcpStream
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>
@@ -348,7 +348,7 @@ impl Read for TcpStream
             if !c.incoming.is_empty()
             {
                 // if we get down here tho -- there is data there -- read however much data we can upto the size of buf
-                let mut nread = buf.len();
+                let mut nread = 0;
                 //the goal is to copy the data from the incoming slices into our buffer and 
                 // then drain the copied data from the incoming connection
                 let (head, tail) = c.incoming.as_slices();

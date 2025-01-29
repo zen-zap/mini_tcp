@@ -22,9 +22,6 @@ bitflags!
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State
 {
-    // define the state of the tcp connection
-    // Closed,  --- if it's closed then we have no State
-    // Listen,  --- if it's listening then we have no State -- since we're listening for a connection to be established
     SynRcvd,
     Estab,
     FinWait1,  // we have sent a FIN and it has not yet been acked 
@@ -60,7 +57,6 @@ pub struct Connection
     pub(crate) incoming: VecDeque<u8>,
     /// bytes that the user has given us, but we haven't been able to send yet
     pub(crate) unacked: VecDeque<u8>,
-    // or it could be that we have sent it as a packet but the other side hasn't ACKed it yet
     pub(crate) closed: bool,  // this is the FIN byte -- virtual byte at the end of the send stream 
     closed_at: Option<u32>,  // this is keep track of the sequence number we have used for the FIN if we have sent it
 }
@@ -177,7 +173,7 @@ impl Connection
         data: &'a [u8],   // this is the body of the TCP packet -- data that the other side wants to send us
     )    -> io::Result<Option<Self>>
     {
-        let mut buf = [0u8; 1500];
+        let buf = [0u8; 1500];
         
         if !tcph.syn() {
             // only expected SYN packet
@@ -185,7 +181,7 @@ impl Connection
         }
 
         // let mut buf = [0u8; 1500];
-        let iss =0;  // initial sequence number
+        let iss = 0;  // initial sequence number
         let wnd = 1024;
         let mut c = Connection 
         {
@@ -260,9 +256,13 @@ impl Connection
         self.tcp.acknowledgment_number = self.recv.nxt;
 
         // TODO: return +1 for SYN/FIN
-        eprintln!("write(seq: {}, limit: {}) syn: {:?} fin: {:?}", seq, limit, self.tcp.fin, self.tcp.syn);
+        eprintln!(
+            "write(ack: {}, seq: {}, limit: {}) syn {:?} fin {:?}",
+            self.recv.nxt - self.recv.irs, seq, limit, self.tcp.syn, self.tcp.fin,
+        );
 
-        let mut offset = seq.wrapping_sub(self.send.una) as usize; // position within the unacked buffer data from where you need to start writing the data
+        let mut offset = seq.wrapping_sub(self.send.una) as usize; 
+        // position within the unacked buffer data from where you need to start writing the data
         
         // we need to special case the 2 virtual bytes --- the SYN and FIN
         if let Some(closed_at) = self.closed_at
@@ -297,16 +297,19 @@ impl Connection
 
         self.ip.set_payload_len(size - self.ip.header_len() as usize);
 
-        // the kernel is nice and does this for us
-        self.tcp.checksum = self.tcp
-                 .calc_checksum_ipv4(&self.ip, &[])
-                 .expect("failed to compute checksum");
-
         // Write out headers =========>  IP Header + TCP Header    
 
+        let buf_len = buf.len();
         let mut unwritten = &mut buf[..];
-        self.tcp.write(&mut unwritten);
+        
         self.ip.write(&mut unwritten);
+        let ip_header_ends_at = buf_len - unwritten.len();
+
+        // we need the entire payload as one contiguous slice to calculate the checksum
+        unwritten = &mut unwritten[self.tcp.header_len() as usize..];
+        let tcp_header_ends_at = buf_len - unwritten.len();
+
+        // here comes the payload
         let payload_bytes = {
             
             let mut written = 0;
@@ -321,10 +324,19 @@ impl Connection
             let p2l = std::cmp::min(limit, t.len());
             written += unwritten.write(&t[..p2l])?;
 
-            written // we wrote this many bytes out to the 2 payloads
+            written // we wrote this many bytes from the 2 payloads
         };  
 
-        let unwritten = unwritten.len();
+        let payload_ends_at = buf_len - unwritten.len();
+
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &buf[tcp_header_ends_at..payload_ends_at])
+            .expect("failed to compute checksum");
+
+        let mut tcp_header_buf = &mut buf[ip_header_ends_at..tcp_header_ends_at];
+        self.tcp.write(&mut tcp_header_buf);
+        
         let mut next_seq = seq.wrapping_add(payload_bytes as u32);
         if self.tcp.syn
         {
@@ -340,7 +352,11 @@ impl Connection
         {
             self.send.nxt = next_seq;
         }
+
         self.timers.send_times.insert(seq, time::Instant::now());
+
+        nic.send(&buf[..payload_ends_at])?;
+
         Ok(payload_bytes)
     }
 
@@ -400,12 +416,11 @@ impl Connection
         {
             // we should retransmit things
             let resend = std::cmp::min(self.unacked.len() as u32, self.send.wnd as u32);
-            if resend < self.send.wnd as u32 && self.closed && self.unacked.len() == 0
+            if resend < self.send.wnd as u32 && self.closed
             {                
                 self.tcp.fin = true;
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32));
             }
-            let (h, t) = self.unacked.as_slices();
             self.write(nic, self.send.una,  resend as usize)?;
         }
         else 
@@ -416,27 +431,22 @@ impl Connection
                 return Ok(()); // we have no more data to send -- the connection is closed and we have sent the FIN
             }
             // otherwise we should just send out as many bytes we're allowed to send
-            let allowed = self.send.wnd - nunacked as u16;
+            let allowed = self.send.wnd as u32 - nunacked as u32;
             if allowed == 0
             {
                 return Ok(()); // we can't send any data -- we also aren't supposed to retransmit anything
             }
             
             let send = std::cmp::min(unsent, allowed as usize);
-            if send < allowed as usize && self.closed && self.closed_at.is_none() && unsent == 0
+            if send < allowed as usize && self.closed && self.closed_at.is_none()
             { // we're allowed to send more, we are supposed to send the FIN, and we have not yet sent the FIN
                 self.tcp.fin = true;
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32));  // unacked start + num_unacked --> FIN
-            }
-
-            
+            }            
 
             self.write(nic, self.send.nxt, send as usize)?;
         }
-        
 
-            // Now call self.write with the extracted slice
-            
         Ok(())
     } 
 
@@ -517,9 +527,9 @@ impl Connection
                 {
                     false // receiver is not ready for any data
                 }
-                // NOTE: If you're confused as to why wrapping_sub is used .. check out the is_between_wrapped function -- it's just the way it's made
+
                 else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1) ,seqn,  wend)
-                         || !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn.wrapping_add(slen -1) , wend)
+                        && !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn.wrapping_add(slen -1) , wend)
                 {
                     // The first byte (SEG.SEQ) falls within the valid range:
                     // RCV.NXT <= SEG.SEQ < RCV.NXT + RCV.WND
@@ -536,6 +546,7 @@ impl Connection
             
         if !okay
         {
+            eprintln!("NOT OKAY!");
             self.write(nic, self.send.nxt,   0)?;
             return Ok(self.availability());
         }
@@ -573,33 +584,51 @@ impl Connection
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) 
             {
-                eprintln!(" ack for {} (last: {}) prune in {:?} ", ackn, self.send.una, self.unacked);
-                if self.unacked.is_empty(){
-                    // if we get an ACK, we remove anything from the unacked queue that has now been acked
-                    let nacked = self.unacked.drain(..(ackn.wrapping_sub(self.send.una) as usize)).count();
+                eprintln!(" ack for {} (last: {}) prune in {:?} ", 
+                            ackn, self.send.una, self.unacked);
+                if !self.unacked.is_empty()
+                {
+                    let data_start = if self.send.una == self.send.iss
+                    {
+                        // data starts just after UNA
+                        self.send.una.wrapping_add(1)
+                    }
+                    else
+                    {
+                        self.send.una
+                    };
+
+                    let acked_data_end = std::cmp::min(ackn.wrapping_sub(data_start) as usize, self.unacked.len());
+                    self.unacked.drain(..acked_data_end);
+
                     // we also wanna remove any of the timers that are relevant
                     let old = std::mem::replace(&mut self.timers.send_times, BTreeMap::new());
+
                     let una = self.send.una;
                     let srtt = &mut self.timers.srtt;
-                    self.timers.send_times.extend(old.into_iter().filter_map(|(seq, sent)|{
-                        if is_between_wrapped(una, seq, ackn)
-                        {
-                            // if the sequence number of the timer is in the list that has now been acked -- then remove it .. since it's no longer relevant
-                            // also gotta deal with the SRTT
-                            
-                            *srtt = 0.8 * (*srtt) + (1.0 - 0.8) * sent.elapsed().as_secs_f64();
-                            None // we're gonna remove the timer
-                        }
-                        else {
-                            Some((seq, sent))
-                        }
-                    }));
+
+                    self.timers
+                        .send_times
+                        .extend(old.into_iter().filter_map(|(seq, sent)| {
+                                if is_between_wrapped(una, seq, ackn)
+                                {
+                                    // if the sequence number of the timer is in the list that has now been acked -- then remove it .. since it's no longer relevant
+                                    // also gotta deal with the SRTT
+                                    
+                                    *srtt = 0.8 * (*srtt) + (1.0 - 0.8) * sent.elapsed().as_secs_f64();
+                                    None // we're gonna remove the timer
+                                }
+                                else {
+                                    Some((seq, sent))
+                                }
+                            }
+                        )
+                    );
                 }
                 
                 self.send.una = ackn;
             }
 
-            // TODO: prune self.unacked -- if the other side sends us ACK for the bytes that are still in the retransmission buffer then we can remove them for the retransmission buffer
             // TODO: if unacked and waiting flush, then notify the user that the flush is completed
             // TODO: Update the current window size
 
@@ -625,18 +654,14 @@ impl Connection
 
         if let State::FinWait1 = self.state 
         {
-            if self.send.una == self.send.iss + 2
-            // when FIN is sent .. it shifts the sequence number by 1
-            // initial sequence number + 1
-            // after FIN, if we sender has sent more data and they are waiting to be acknowledged .. then una
-            // should be the start of those unacked bytes ..
-            // so iss + 1 + 1(for the unacked)
-            // so una should be this for FIN_WAIT_1
+            if let Some(closed_at) = self.closed_at 
             {
-                // our FIN has been ACKed
-                eprintln!("they've acked our fin!");
-                self.state = State::FinWait2;
-            }            
+                if self.send.una == closed_at.wrapping_add(1) 
+                {
+                    // our FIN was ACKed!
+                    self.state = State::FinWait2;
+                }
+            }           
         }        
 
         if !data.is_empty()
@@ -644,23 +669,21 @@ impl Connection
             if let State::Estab | State::FinWait1 | State::FinWait2 = self.state
             {
                 let mut unread_data_at = (self.recv.nxt - seqn) as usize;
-                if unread_data_at >= data.len()
+                if unread_data_at > data.len()
                 {
                     // We must have received a retransmitted FIN that we have already seen
                     // nxt points to beyond the FIN -- but the FIN is not in data
                     assert_eq!(unread_data_at, data.len()+1);
-                    unread_data_at = 0;   // if the packet has a SYN flag set, then we need to decrement the unread data at
+                    unread_data_at = 0;
                 }
-                println!(" reading data at ({} : {}) from {:#?}", self.recv.nxt, seqn, data);
+                eprintln!(" reading data at ({} : {}) from {:#?}", self.recv.nxt, seqn, data);
 
                 // when we receive data we need to stick it into incoming buffer                
                 self.incoming.extend(&data[unread_data_at..]); // add the data to the incoming buffer   -- this is no longer empty
                 // the readers are woken by the main event loop based on what the function returns 
                 // we also need to ack the bytes that we received to the other side
 
-                self.recv.nxt = seqn
-                                .wrapping_add(data.len() as u32)
-                                .wrapping_add(if tcph.fin() {1} else {0}); // we update self.recv.nxt here
+                self.recv.nxt = seqn.wrapping_add(data.len() as u32); // we update self.recv.nxt here
 
                 /*
                 * Once the TCP takes accountability for the data it receives,
@@ -671,14 +694,8 @@ impl Connection
                 * SEND_ACK ===> Send an acknowledgment of the form: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
                 */
 
-                // TODO: maybe just tick to piggyback ack on data?
                 self.write(nic, self.send.nxt, 0)?; // this will send the acknowledgement to the other side
 
-
-                /*
-                // no we need to be able to receive the data from the other side ... so we no longer need this
-                
-                */
             } 
         }      
 
@@ -692,6 +709,7 @@ impl Connection
                 {
                     // So here is where we get a FIN from the other side
                     // we're done with the connection
+                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
                     self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
                     eprintln!("they've finned!");
@@ -736,7 +754,7 @@ fn wrapping_lt(lhs: u32, rhs: u32) -> bool
         // To insure that new data is never mistakenly considered as old and vice-versa,
         // the left edge of the sender's window has to be at most 
         // 2**31 away from the right edge of the receiver's window.
-    lhs.wrapping_sub(rhs) > 2^31
+    lhs.wrapping_sub(rhs) > (1 << 31)
 }
 fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool
 {

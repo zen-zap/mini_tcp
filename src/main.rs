@@ -5,14 +5,12 @@ use std::io::prelude::*;
 fn main() -> io::Result<()> {
     let mut i = mini_tcp::Interface::new()?;
     eprintln!("created  interface");
-    let mut l1 = i.bind(5600)?;
-    // eprintln!("bound ot 9000");
-
-    let jh = thread::spawn(move || {
-        while let Ok(mut stream) = l1.accept()
-        {
-            eprintln!("got connection!");
-            stream.write(b"hello").unwrap();
+    let mut l1 = i.bind(8000)?;    
+    while let Ok(mut stream) = l1.accept()
+    {
+        eprintln!("got connection!");
+        thread::spawn(move || {
+            stream.write(b" it works!\n").unwrap();
             stream.shutdown(std::net::Shutdown::Write).unwrap(); // we're now gonna do this manually
             loop {
                 let mut buf=[0u8; 512];
@@ -27,8 +25,7 @@ fn main() -> io::Result<()> {
                     println!("got {} from the other side", std::str::from_utf8(&buf[..n]).unwrap());
                 }
             }
-        }
-    });
-    jh.join().unwrap();
+        });
+    }
     Ok(())
 }
